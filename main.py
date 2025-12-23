@@ -1,20 +1,15 @@
 """
-LAN-Based Offline Media Server
-FastAPI backend for serving media files over local Wi-Fi network.
-
-Features (MVP):
-- List all files in the './files' directory with metadata
-- Stream/download individual files efficiently
-- Proper error handling and HTTP status codes
-- CORS disabled by default (LAN-only usage)
+LAN-Based Offline Media Server (FastAPI)
+Supports streaming, downloading, and resume for large files (videos, etc.)
+Works perfectly with the Android app.
 """
 
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import List
+import mimetypes
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, JSONResponse
 
 # ----------------------------------------------------------------------
@@ -22,73 +17,62 @@ from fastapi.responses import StreamingResponse, JSONResponse
 # ----------------------------------------------------------------------
 APP_TITLE = "LAN Media Server"
 APP_VERSION = "1.0.0"
-FILES_DIRECTORY = Path("files")
 
-# Ensure the files directory exists
+# Folder where your media files are stored
+FILES_DIRECTORY = Path("files")
 FILES_DIRECTORY.mkdir(exist_ok=True)
 
 app = FastAPI(
     title=APP_TITLE,
     version=APP_VERSION,
-    description="Offline media server for LAN-based Android streaming application",
+    description="Offline LAN media server for Android streaming app",
 )
-
 
 # ----------------------------------------------------------------------
 # Helper Functions
 # ----------------------------------------------------------------------
 def get_file_metadata(path: Path) -> dict:
-    """
-    Extract metadata for a single file.
-    """
+    """Get metadata for a file."""
     stat = path.stat()
     return {
         "name": path.name,
-        "size": stat.st_size,                    # Size in bytes
-        "lastModified": datetime.fromtimestamp(stat.st_mtime).isoformat(),  # ISO 8601 format
+        "size": stat.st_size,
+        "lastModified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
     }
 
-
 def list_media_files() -> List[dict]:
-    """
-    Return metadata for all files in the FILES_DIRECTORY.
-    Only regular files are included (no directories or hidden files).
-    """
+    """List all media files in the root directory."""
     files = []
     for item in FILES_DIRECTORY.iterdir():
         if item.is_file() and not item.name.startswith("."):
             files.append(get_file_metadata(item))
-    # Sort by name for consistent ordering
     files.sort(key=lambda x: x["name"].lower())
     return files
 
+def stream_full_file(file_path: Path, chunk_size: int = 1024 * 1024):
+    """Stream the entire file."""
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            yield chunk
 
-async def file_generator(file_path: Path):
-    """
-    Asynchronous generator for streaming file content in chunks.
-    Prevents loading large files entirely into memory.
-    """
-    chunk_size = 1024 * 1024  # 1 MB chunks
-    try:
-        with open(file_path, "rb") as f:
-            while chunk := f.read(chunk_size):
-                yield chunk
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error reading file: {str(e)}"
-        )
-
+def stream_range(file_path: Path, start: int, end: int, chunk_size: int = 8192):
+    """Stream a byte range from the file."""
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            read_size = min(chunk_size, remaining)
+            chunk = f.read(read_size)
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
 
 # ----------------------------------------------------------------------
 # API Endpoints
 # ----------------------------------------------------------------------
 @app.get("/")
 async def root():
-    """
-    Root endpoint – provides basic server status.
-    Useful for quick connectivity testing from the Android app or browser.
-    """
     return {
         "message": "LAN Media Server is running",
         "title": APP_TITLE,
@@ -96,70 +80,97 @@ async def root():
         "files_count": len(list_media_files()),
     }
 
-
-@app.get("/api/files", response_model=List[dict])
+@app.get("/api/files")
 async def get_file_list():
-    """
-    Retrieve metadata for all available media files.
-    """
+    """Return list of all files in the media folder."""
     try:
-        files = list_media_files()
-        return JSONResponse(content=files)
+        return JSONResponse(content=list_media_files())
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list files: {str(e)}"
         )
 
+@app.get("/api/files/{filename:path}")
+async def get_file(filename: str, request: Request, download: bool = False):
+    """Stream or download a file with resume support."""
+    # Security: prevent path traversal
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
-@app.get("/api/files/{filename}")
-async def get_file(filename: str):
-    """
-    Stream or download a specific file.
-    Uses StreamingResponse for efficient handling of large media files.
-    """
     file_path = FILES_DIRECTORY / filename
 
     if not file_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
+        raise HTTPException(status_code=404, detail="File not found")
 
-    # Determine media type (basic mapping)
-    content_type_map = {
-        ".mp4": "video/mp4",
-        ".mkv": "video/x-matroska",
-        ".webm": "video/webm",
-        ".mp3": "audio/mpeg",
-        ".wav": "audio/wav",
-        ".flac": "audio/flac",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".pdf": "application/pdf",
-        ".txt": "text/plain",
+    file_size = file_path.stat().st_size
+
+    # Guess MIME type
+    media_type, _ = mimetypes.guess_type(file_path.name)
+    media_type = media_type or "application/octet-stream"
+
+    disposition = "attachment" if download else "inline"
+
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'{disposition}; filename="{file_path.name}"',
     }
 
-    media_type = content_type_map.get(file_path.suffix.lower(), "application/octet-stream")
+    range_header = request.headers.get("Range")
 
+    if range_header:
+        # Parse Range header: "bytes=0-" or "bytes=12345-"
+        try:
+            if not range_header.startswith("bytes="):
+                raise ValueError("Invalid unit")
+
+            range_str = range_header[6:].strip()
+            start_str, end_str = (range_str.split("-") + [""])[:2]
+
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+
+            if start >= file_size or start < 0 or (end_str and end < start):
+                raise HTTPException(status_code=416, detail="Range not satisfiable")
+
+            length = end - start + 1
+
+            headers = {
+                **base_headers,
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(length),
+            }
+
+            return StreamingResponse(
+                stream_range(file_path, start, end),
+                status_code=206,  # Partial Content
+                headers=headers,
+                media_type=media_type,
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Malformed Range header")
+        except Exception as e:
+            raise HTTPException(status_code=416, detail=f"Range error: {str(e)}")
+
+    # Full file download (no Range header)
     headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{file_path.name}"',
+        **base_headers,
+        "Content-Length": str(file_size),
     }
 
     return StreamingResponse(
-        file_generator(file_path),
-        media_type=media_type,
+        stream_full_file(file_path),
+        status_code=200,
         headers=headers,
+        media_type=media_type,
     )
 
-
 # ----------------------------------------------------------------------
-# Run Instructions (for reference)
+# Run Server
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    # Binds to all interfaces (0.0.0.0) so it's accessible on LAN
+    print(f"{APP_TITLE} v{APP_VERSION} starting...")
+    print(f"Serving files from: {FILES_DIRECTORY.resolve()}")
+    print("Access from LAN devices: http://YOUR_PC_IP:8000")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
